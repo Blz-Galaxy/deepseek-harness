@@ -2,6 +2,9 @@ name: Build ARM64 Offline Bundle (npm)
 
 on:
   workflow_dispatch:
+  
+permissions:
+  contents: write        # 关键：授予创建 Release 的权限
 
 jobs:
   build:
