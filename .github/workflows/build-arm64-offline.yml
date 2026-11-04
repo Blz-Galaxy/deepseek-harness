@@ -27,7 +27,7 @@ jobs:
       - name: Prepare offline archive
         run: |
           # 将构建产物和完整的 node_modules 一起打包
-          tar -czf dsh-web-arm64-offline.tar.gz \
+          tar -czf /tmp/dsh-web-arm64-offline.tar.gz \
             --exclude='./.git' \
             --exclude='./.github' \
             . 
@@ -37,4 +37,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dsh-web-arm64-offline
-          path: dsh-web-arm64-offline.tar.gz
+          path: /tmp/dsh-web-arm64-offline.tar.gz
