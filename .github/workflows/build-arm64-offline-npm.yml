@@ -1,0 +1,61 @@
+name: Build ARM64 Offline Bundle (npm)
+
+on:
+  workflow_dispatch:        # 手动触发
+  push:
+    tags:
+      - 'v*'                # 推 tag 时自动触发（可选）
+
+jobs:
+  build:
+    # 关键：使用 GitHub 原生的 ARM64 Linux Runner
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          # DSH 要求 Node.js 24.9+，使用 24.x 会拉取最新的 24 版本
+          node-version: '24'
+          # 不配置 cache，因为这不是一个带 lockfile 的源码项目
+
+      - name: Install DSH from npm
+        run: |
+          npm init -y
+          npm install @deepseek-ai/dsh
+
+      - name: Verify installation
+        run: |
+          node --version
+          ./node_modules/.bin/dsh --version
+
+      - name: Package offline bundle
+        run: |
+          # 只打包运行所需的最小三件套，排除源码/构建缓存
+          tar -czhf /tmp/dsh-web-arm64-offline.tar.gz \
+            --warning=no-file-changed \
+            package.json \
+            package-lock.json \
+            node_modules
+
+      - name: Upload to Actions Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: dsh-web-arm64-offline
+          path: /tmp/dsh-web-arm64-offline.tar.gz
+          retention-days: 30
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          # 用运行编号作为 tag，每次手动运行都会创建新 Release
+          tag_name: offline-${{ github.run_number }}
+          name: DSH ARM64 Offline Bundle #${{ github.run_number }}
+          files: /tmp/dsh-web-arm64-offline.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
