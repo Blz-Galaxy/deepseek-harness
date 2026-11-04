@@ -8,12 +8,12 @@ jobs:
     runs-on: ubuntu-22.04-arm # 关键：使用 GitHub 的 ARM64 原生 runner
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       
       - name: Setup pnpm & Node.js
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
               
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24' # 或 22，满足 dsh 要求
           cache: 'pnpm'
@@ -34,7 +34,16 @@ jobs:
           # 注意：这里打包的是整个仓库根目录，包含了 node_modules
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dsh-web-arm64-offline
           path: /tmp/dsh-web-arm64-offline.tar.gz
+
+      - name: Create Release and upload asset
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ github.run_number }}
+          name: dsh-web-arm64-offline-${{ github.run_number }}
+          files: /tmp/dsh-web-arm64-offline.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
