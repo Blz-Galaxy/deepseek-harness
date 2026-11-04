@@ -5,15 +5,14 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm # 关键：使用 GitHub 的 ARM64 原生 runner
+    runs-on: ubuntu-22.04-arm # 关键：使用 GitHub 的 ARM64 原生 runner
     
     steps:
       - uses: actions/checkout@v4
       
       - name: Setup pnpm & Node.js
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
+              
       - uses: actions/setup-node@v4
         with:
           node-version: '24' # 或 22，满足 dsh 要求
