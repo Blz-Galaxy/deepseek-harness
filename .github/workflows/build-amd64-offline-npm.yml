@@ -1,0 +1,406 @@
+name: Build x86_64 Offline Bundle (Kali, npm)
+
+# 面向 Kali Linux / Debian amd64 的离线包：在 CI 中从 npm 安装 @deepseek-ai/dsh，
+# 连同官方 Node.js linux-x64 运行时、全部 npm 依赖、预编译原生模块和 ripgrep
+# 一起打包。目标机器解压即用，不需要 Node.js / npm / pnpm，也不会联网下载依赖。
+#
+# 与 “Build ARM64 Offline Bundle (npm)” 的区别：
+#   - runner 为 x86_64；
+#   - 额外携带 Node.js 运行时（Kali 默认没有 Node 24）；
+#   - 生成启动器、install.sh、中文使用说明和 SHA256 校验文件；
+#   - 增加离线启动与 Web 冒烟验证，避免打出“能解压但不能用”的包。
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: '打包的 @deepseek-ai/dsh 版本（npm 版本号或 dist-tag，如 latest / 0.2.2-rc.1）'
+        type: string
+        default: latest
+        required: true
+      node_version:
+        description: '随包携带的 Node.js 版本（必须满足 @deepseek-ai/dsh 的 engines: >=24.9）'
+        type: string
+        default: '24'
+        required: true
+
+permissions:
+  contents: write        # 创建 Release 需要
+
+concurrency:
+  group: offline-amd64-bundle
+  cancel-in-progress: false
+
+env:
+  BUNDLE_NAME: dsh-kali-amd64-offline
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  build:
+    name: Build Kali x86_64 offline bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Check x86_64 runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64" || { echo "::error::需要 x86_64 runner，当前为 $(uname -m)"; exit 1; }
+          node -e "const [major, minor] = process.versions.node.split('.').map(Number); if (major < 24 || (major === 24 && minor < 9)) { console.error('需要 Node.js >= 24.9，当前 ' + process.version); process.exit(1) }"
+          printf 'glibc: %s\n' "$(getconf GNU_LIBC_VERSION)"
+          printf 'node: %s\n' "$(node --version)"
+          printf 'npm: %s\n' "$(npm --version)"
+
+      - name: Install DSH in isolated directory
+        env:
+          DSH_VERSION_INPUT: ${{ inputs.dsh_version }}
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+          mkdir -p "$BUNDLE/app"
+          cd "$BUNDLE/app"
+          npm init -y >/dev/null
+          # --include=optional 保证 linux-x64 的 node-pty / koffi / node-addon-system
+          # 等按平台分发的可选依赖被装上；缺少它们时对应能力会在目标机上失效。
+          npm install --no-audit --no-fund --include=optional \
+            --fetch-retries=5 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=120000 \
+            "@deepseek-ai/dsh@${DSH_VERSION_INPUT}"
+
+          DSH_VERSION=$(node -p "require('./node_modules/@deepseek-ai/dsh/package.json').version")
+          echo "DSH_VERSION=$DSH_VERSION" >> "$GITHUB_ENV"
+          printf 'Installed @deepseek-ai/dsh@%s\n' "$DSH_VERSION"
+
+      - name: Stage bundled Node.js runtime
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+          NODE_BIN=$(readlink -f "$(command -v node)")
+          NODE_PREFIX=$(dirname "$(dirname "$NODE_BIN")")
+          mkdir -p "$BUNDLE/node/bin"
+          install -m 0755 "$NODE_BIN" "$BUNDLE/node/bin/node"
+          if [ -f "$NODE_PREFIX/LICENSE" ]; then
+            install -m 0644 "$NODE_PREFIX/LICENSE" "$BUNDLE/node/LICENSE"
+          fi
+          NODE_RUNTIME_VERSION=$("$BUNDLE/node/bin/node" --version)
+          echo "NODE_RUNTIME_VERSION=$NODE_RUNTIME_VERSION" >> "$GITHUB_ENV"
+          printf 'Staged Node.js %s (linux-x64)\n' "$NODE_RUNTIME_VERSION"
+
+      - name: Write launcher, installer and README
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+
+          cat > "$BUNDLE/dsh" <<'LAUNCHER'
+          #!/bin/sh
+          # DSH 离线启动器：使用包内 Node.js 与 @deepseek-ai/dsh，不联网下载依赖。
+          set -eu
+
+          # 解析符号链接，保证从 /usr/local/bin/dsh 等链接入口启动时仍能找到包目录。
+          target=$0
+          while [ -h "$target" ]; do
+            link_dir=$(CDPATH= cd -P -- "$(dirname -- "$target")" && pwd)
+            link=$(readlink "$target")
+            case $link in
+              /*) target=$link ;;
+              *) target=$link_dir/$link ;;
+            esac
+          done
+          SELF_DIR=$(CDPATH= cd -P -- "$(dirname -- "$target")" && pwd)
+
+          NODE="$SELF_DIR/node/bin/node"
+          APP="$SELF_DIR/app/node_modules/@deepseek-ai/dsh/lib/bin.js"
+
+          if [ ! -x "$NODE" ]; then
+            printf 'dsh: 缺少包内 Node.js 运行时：%s\n' "$NODE" >&2
+            exit 1
+          fi
+          if [ ! -f "$APP" ]; then
+            printf 'dsh: 缺少 @deepseek-ai/dsh 包：%s\n' "$APP" >&2
+            exit 1
+          fi
+
+          # 让 DSH 派生的 node 子进程也使用包内运行时。
+          PATH="$SELF_DIR/node/bin:$PATH"
+          export PATH
+          exec "$NODE" "$APP" "$@"
+          LAUNCHER
+          chmod 0755 "$BUNDLE/dsh"
+
+          cat > "$BUNDLE/install.sh" <<'INSTALLER'
+          #!/bin/sh
+          # 把离线包里的 dsh 注册到 PATH。默认 /usr/local/bin，需要 sudo。
+          set -eu
+
+          PREFIX=/usr/local
+          while [ "$#" -gt 0 ]; do
+            case "$1" in
+              --prefix)
+                [ "$#" -ge 2 ] || { echo "install.sh: --prefix 需要一个目录" >&2; exit 2; }
+                PREFIX=$2
+                shift 2
+                ;;
+              --prefix=*)
+                PREFIX=${1#--prefix=}
+                shift
+                ;;
+              -h|--help)
+                cat <<'USAGE'
+          用法: ./install.sh [--prefix <目录>]
+            默认把 dsh 链接到 /usr/local/bin；无 sudo 权限时可 --prefix "$HOME/.local"。
+          USAGE
+                exit 0
+                ;;
+              *)
+                echo "install.sh: 未知参数 $1" >&2
+                exit 2
+                ;;
+            esac
+          done
+
+          SELF_DIR=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
+
+          case "$(uname -m)" in
+            x86_64|amd64) ;;
+            *) echo "install.sh: 需要 x86_64 系统，当前为 $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          if ! "$SELF_DIR/node/bin/node" --version >/dev/null 2>&1; then
+            echo "install.sh: 包内 Node.js 无法启动；请确认系统已安装 glibc >= 2.28 和 libstdc++6。" >&2
+            exit 1
+          fi
+
+          mkdir -p "$PREFIX/bin"
+          ln -sf "$SELF_DIR/dsh" "$PREFIX/bin/dsh"
+          echo "已安装 $PREFIX/bin/dsh -> $SELF_DIR/dsh"
+          echo "运行: dsh web"
+          INSTALLER
+          chmod 0755 "$BUNDLE/install.sh"
+
+          cat > "$BUNDLE/README.md" <<'README_EOF'
+          # DSH Kali Linux x86_64 离线包
+
+          由 GitHub Actions 工作流 “Build x86_64 Offline Bundle (Kali, npm)” 生成。
+
+          - `@deepseek-ai/dsh` @DSH_VERSION@
+          - Node.js @NODE_RUNTIME@（官方 linux-x64 构建，随包携带）
+
+          包内已包含全部 npm 依赖、linux-x64 预编译原生模块（node-pty、koffi、
+          @deepseek-ai/node-addon-system）和 ripgrep。目标机器不需要安装 Node.js、
+          npm 或 pnpm，也不会联网下载依赖。
+
+          ## 系统要求
+
+          - Kali Linux（或 Debian）x86_64
+          - glibc >= 2.28；Kali 2022.4 及以后版本均满足
+          - libstdc++6（Kali 默认安装）
+
+          ## 使用
+
+          建议解压到长期保留的目录（如 `/opt` 或 `~/dsh`），不要放在下载目录里，
+          否则清理下载目录会让已安装的 `dsh` 链接失效。
+
+          ```sh
+          sudo mkdir -p /opt/dsh && sudo tar -xzf dsh-kali-amd64-offline-@DSH_VERSION@.tar.gz -C /opt/dsh --strip-components=1
+          sudo /opt/dsh/install.sh   # 链接到 /usr/local/bin/dsh
+          dsh web                    # 或 /opt/dsh/dsh web
+          ```
+
+          不想用 sudo 时，可直接在当前目录运行 `./dsh web`，或用
+          `./install.sh --prefix "$HOME/.local"` 装到用户目录。
+
+          终端会打印带 token 的 Web 地址（默认 http://127.0.0.1:3080），在虚拟机
+          浏览器中打开即可。首次启动会在 `~/.dsh` 下生成 web profile。
+
+          模型 API Key、代理等配置放在 `~/.dsh/.env`，例如：
+
+          ```sh
+          mkdir -p ~/.dsh
+          printf 'DEEPSEEK_API_KEY=sk-...\n' >> ~/.dsh/.env
+          ```
+
+          一次性命令行任务可改用：
+
+          ```sh
+          dsh --profile headless "你的任务"
+          ```
+
+          ## 离线边界
+
+          依赖、运行时、前端资源和预编译二进制全部在包内；启动和加载 profile
+          不访问网络。模型请求仍需要可达的模型端点（DeepSeek 官方 API、内网网关
+          或 HTTP 代理），这不属于依赖下载。同理，`dsh plugin` / 插件市场的在线
+          安装在纯内网环境不可用，基础功能不受影响。
+
+          ## 目录结构
+
+          ```
+          dsh-kali-amd64-offline-@DSH_VERSION@/
+            dsh              # 启动器（使用包内 node）
+            install.sh       # 可选：注册到 PATH
+            node/bin/node    # 官方 Node.js linux-x64 运行时
+            app/             # npm 安装的 @deepseek-ai/dsh 及全部依赖
+            README.md
+          ```
+
+          ## 校验
+
+          ```sh
+          sha256sum -c dsh-kali-amd64-offline-@DSH_VERSION@.tar.gz.sha256
+          ```
+
+          ## 卸载
+
+          删除安装目录（例如 `/opt/dsh`）即可；若执行过 `install.sh`，再删除
+          对应的 `bin/dsh` 链接（默认 `/usr/local/bin/dsh`）。
+          README_EOF
+
+          sed \
+            -e "s/@DSH_VERSION@/$DSH_VERSION/g" \
+            -e "s/@NODE_RUNTIME@/$NODE_RUNTIME_VERSION/g" \
+            "$BUNDLE/README.md" > "$BUNDLE/README.md.tmp"
+          mv "$BUNDLE/README.md.tmp" "$BUNDLE/README.md"
+
+          cat > "$BUNDLE/VERSION" <<EOF
+          dsh=$DSH_VERSION
+          node=$NODE_RUNTIME_VERSION
+          arch=x86_64
+          target=kali-linux
+          generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          run=$GITHUB_RUN_ID/$GITHUB_RUN_NUMBER
+          EOF
+
+      - name: Verify bundled runtime and native modules
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+          cd "$BUNDLE"
+
+          printf 'bundled node: %s\n' "$(./node/bin/node --version)"
+          printf 'bundled dsh: %s\n' "$(./dsh --version)"
+
+          # 按平台分发的原生依赖必须真实存在，否则目标机首次使用相关能力才报错。
+          PTY_NODE=$(find app/node_modules -path '*/node-pty/prebuilds/linux-x64/pty.node' -print -quit)
+          RG_BIN=$(find app/node_modules -path '*/@vscode/ripgrep-linux-x64/bin/rg' -print -quit)
+          KOFFI_NODE=$(find app/node_modules -path '*/@koromix/koffi-linux-x64/linux_x64/koffi.node' -print -quit)
+          SYSTEM_NODE=$(find app/node_modules -path '*/node-addon-system-linux-x64/bin/glibc/system.node' -print -quit)
+
+          [ -n "$PTY_NODE" ] || { echo "::error::缺少 node-pty linux-x64 预编译模块"; exit 1; }
+          if [ -z "$RG_BIN" ] || [ ! -x "$RG_BIN" ]; then
+            echo "::error::缺少可执行的 linux-x64 ripgrep 二进制"
+            exit 1
+          fi
+          [ -n "$KOFFI_NODE" ] || { echo "::error::缺少 koffi linux-x64 预编译模块（可能退回了本机编译，glibc 兼容性不可控）"; exit 1; }
+          [ -n "$SYSTEM_NODE" ] || { echo "::error::缺少 node-addon-system linux-x64 原生模块"; exit 1; }
+
+          printf 'linux-x64 原生依赖:\n  %s\n  %s\n  %s\n  %s\n' "$PTY_NODE" "$RG_BIN" "$KOFFI_NODE" "$SYSTEM_NODE"
+
+          # 启动器必须能用包内 node 执行，而不是碰系统 PATH 里的 node。
+          env -u NODE_OPTIONS ./dsh --version >/dev/null
+
+      - name: Smoke-test Web boot
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+          HOME=$(mktemp -d)
+          export HOME
+          LOG="$RUNNER_TEMP/dsh-web.log"
+
+          "$BUNDLE/dsh" web --no-open --port 3099 >"$LOG" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
+
+          READY=0
+          CODE=000
+          for _ in $(seq 1 90); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::dsh web 在就绪前退出"
+              cat "$LOG"
+              exit 1
+            fi
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:3099/ || true)
+            if [ -n "$CODE" ] && [ "$CODE" != "000" ]; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::dsh web 未在 127.0.0.1:3099 上响应"
+            cat "$LOG"
+            exit 1
+          fi
+
+          echo "dsh web 已响应 HTTP $CODE"
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          trap - EXIT
+
+      - name: Verify profile load without network
+        run: |
+          set -euo pipefail
+          BUNDLE="$RUNNER_TEMP/dsh-bundle"
+          OFFLINE_HOME=$(mktemp -d /tmp/dsh-offline-home.XXXXXX)
+
+          if sudo -n unshare -n true 2>/dev/null; then
+            # 无网络命名空间（只有 lo），证明解压后的包不依赖任何下载即可加载 web profile。
+            sudo -n unshare -n env HOME="$OFFLINE_HOME" "$BUNDLE/dsh" --profile web --dump-config >/dev/null
+            echo "离线检查通过：web profile 在无网络命名空间中完成加载。"
+          else
+            echo "::warning::当前 runner 不支持 unshare -n，跳过网络命名空间检查。"
+            HOME="$OFFLINE_HOME" "$BUNDLE/dsh" --profile web --dump-config >/dev/null
+          fi
+
+      - name: Package offline archive
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mv dsh-bundle "$BUNDLE_NAME"
+          ARCHIVE="$BUNDLE_NAME-$DSH_VERSION.tar.gz"
+
+          # -h 解开 node_modules 内的符号链接，避免目标机解压后出现悬空链接；
+          # --warning=no-file-changed 忽略 npm 安装期间可能产生的并发改动告警。
+          tar -czhf "$ARCHIVE" --warning=no-file-changed "$BUNDLE_NAME"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+          ls -lh "$ARCHIVE" "$ARCHIVE.sha256"
+          du -sh "$BUNDLE_NAME"
+
+      - name: Upload to Actions Artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ env.BUNDLE_NAME }}-${{ env.DSH_VERSION }}
+          path: |
+            ${{ runner.temp }}/${{ env.BUNDLE_NAME }}-${{ env.DSH_VERSION }}.tar.gz
+            ${{ runner.temp }}/${{ env.BUNDLE_NAME }}-${{ env.DSH_VERSION }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: offline-amd64-${{ github.run_number }}
+          name: DSH Kali x86_64 Offline Bundle ${{ env.DSH_VERSION }} (#${{ github.run_number }})
+          body: |
+            Kali Linux / Debian x86_64 离线包，内含 Node.js、全部 npm 依赖与预编译原生模块；
+            目标机器无需安装 Node.js / npm，也不会联网下载依赖。
+
+            ```sh
+            sha256sum -c dsh-kali-amd64-offline-${{ env.DSH_VERSION }}.tar.gz.sha256
+            tar -xzf dsh-kali-amd64-offline-${{ env.DSH_VERSION }}.tar.gz
+            cd dsh-kali-amd64-offline-${{ env.DSH_VERSION }}
+            ./install.sh
+            dsh web
+            ```
+          files: |
+            ${{ runner.temp }}/${{ env.BUNDLE_NAME }}-${{ env.DSH_VERSION }}.tar.gz
+            ${{ runner.temp }}/${{ env.BUNDLE_NAME }}-${{ env.DSH_VERSION }}.tar.gz.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
